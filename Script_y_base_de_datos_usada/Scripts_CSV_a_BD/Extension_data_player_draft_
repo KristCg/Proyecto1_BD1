@@ -1,0 +1,150 @@
+##Extension de los datos para las temporadas de jugadores 
+
+import time
+import unicodedata
+import psycopg2
+from psycopg2.extras import execute_values
+from nba_api.stats.endpoints import drafthistory, commonallplayers
+
+DB_CONFIG = {
+    "dbname": "proyecto01_bd",
+    "user": "postgres",
+    "password": "1506",
+    "host": "localhost",
+    "port": "5432",
+}
+
+
+def normaliza_nombre(value: str) -> str:
+    if not value:
+        return None
+    value = str(value).strip()
+    return unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("utf-8")
+
+
+def actualizar_catalogo_jugadores(conn):
+    print("\n=== Actualizando catálogo de Jugadores (Player) ===")
+    cursor = conn.cursor()
+
+    players_data = commonallplayers.CommonAllPlayers(is_only_current_season=0).get_data_frames()[0]
+
+    registros = []
+    for _, row in players_data.iterrows():
+        p_id = int(row['PERSON_ID'])
+        full_name = normaliza_nombre(row.get('DISPLAY_FIRST_LAST'))
+        
+        partes = full_name.split(' ', 1) if full_name else ['', '']
+        first_name = partes[0][:25]
+        last_name = partes[1][:25] if len(partes) > 1 else ''
+        
+        from_year = int(row['FROM_YEAR']) if row.get('FROM_YEAR') and str(row['FROM_YEAR']).isdigit() else None
+        to_year = int(row['TO_YEAR']) if row.get('TO_YEAR') and str(row['TO_YEAR']).isdigit() else None
+        roster_status = row.get('ROSTERSTATUS')
+        is_active = bool(roster_status) and float(roster_status) == 1.0
+
+        draft_year = int(row['DRAFT_YEAR']) if row.get('DRAFT_YEAR') and str(row['DRAFT_YEAR']).isdigit() else None
+        draft_round = int(row['DRAFT_ROUND']) if row.get('DRAFT_ROUND') and str(row['DRAFT_ROUND']).isdigit() else None
+        draft_number = int(row['DRAFT_NUMBER']) if row.get('DRAFT_NUMBER') and str(row['DRAFT_NUMBER']).isdigit() else None
+
+        registros.append((
+            p_id, full_name[:50] if full_name else None, first_name, last_name,
+            from_year, to_year, is_active, draft_year, draft_round, draft_number
+        ))
+
+    query = """
+        INSERT INTO Player (player_id, full_name, first_name, last_name, from_year, to_year, is_active, draft_year, draft_round, draft_number)
+        VALUES %s
+        ON CONFLICT (player_id) DO UPDATE SET
+            full_name = EXCLUDED.full_name,
+            from_year = EXCLUDED.from_year,
+            to_year = EXCLUDED.to_year,
+            is_active = EXCLUDED.is_active,
+            draft_year = EXCLUDED.draft_year,
+            draft_round = EXCLUDED.draft_round,
+            draft_number = EXCLUDED.draft_number;
+    """
+    execute_values(cursor, query, registros)
+    conn.commit()
+    print(f"Catálogo de jugadores actualizado: {len(registros)} procesados.")
+    cursor.close()
+
+
+def actualizar_draft_faltante(conn):
+    print("\n=== Actualizando tabla Draft (2021-2025) ===")
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT UPPER(TRIM(abbreviation)), team_id FROM Team;")
+    team_map = {abbr: tid for abbr, tid in cursor.fetchall()}
+
+    draft_df = drafthistory.DraftHistory().get_data_frames()[0]
+
+    anios_faltantes = ['2021', '2022', '2023', '2024', '2025']
+    draft_filtrado = draft_df[draft_df['SEASON'].astype(str).isin(anios_faltantes)]
+
+    jugadores_draft = []
+    for _, row in draft_filtrado.iterrows():
+        p_id = int(row['PERSON_ID'])
+        p_name = normaliza_nombre(row.get('PLAYER_NAME'))
+        if p_id and p_name:
+            jugadores_draft.append((p_id, p_name[:50]))
+
+    if jugadores_draft:
+        query_players = """
+            INSERT INTO Player (player_id, full_name)
+            VALUES %s
+            ON CONFLICT (player_id) DO NOTHING;
+        """
+        execute_values(cursor, query_players, jugadores_draft)
+        conn.commit()
+
+    registros = []
+    for _, row in draft_filtrado.iterrows():
+        year_draft = int(row['SEASON'])
+        round_number = int(row['ROUND_NUMBER']) if str(row.get('ROUND_NUMBER')).isdigit() else None
+        round_pick = int(row['ROUND_PICK']) if str(row.get('ROUND_PICK')).isdigit() else None
+        pick_overall = int(row['OVERALL_PICK']) if str(row.get('OVERALL_PICK')).isdigit() else None
+        player_id = int(row['PERSON_ID'])
+        
+        team_abbr = str(row.get('TEAM_ABBREVIATION')).strip().upper()
+        team_id = team_map.get(team_abbr)
+        
+        org_from = str(row.get('ORGANIZATION')).strip()[:60] if row.get('ORGANIZATION') else None
+        type_org = str(row.get('ORGANIZATION_TYPE')).strip()[:30] if row.get('ORGANIZATION_TYPE') else None
+
+        if team_id:
+            registros.append((
+                year_draft,
+                round_number,
+                round_pick,
+                pick_overall,
+                player_id,
+                team_id,
+                org_from,
+                type_org
+            ))
+
+    if registros:
+        query_draft = """
+            INSERT INTO Draft (
+                year_draft, round_number, round_pick, pick_overall, 
+                player_id, team_id, organization_from, type_organization_from
+            )
+            VALUES %s;
+        """
+        execute_values(cursor, query_draft, registros)
+        conn.commit()
+        print(f"Draft actualizado: {len(registros)} selecciones insertadas exitosamente.")
+    cursor.close()
+
+
+def main():
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        actualizar_catalogo_jugadores(conn)
+        actualizar_draft_faltante(conn)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

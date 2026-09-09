@@ -1,0 +1,148 @@
+## Extension de datos para la tabla Player_season_stats con estadísticas reales por jugador y temporada, desde 2015/16 hasta 2025/26, usando leaguedashplayerstats del NBA API
+
+import time
+import psycopg2
+from psycopg2.extras import execute_values
+from nba_api.stats.endpoints import leaguedashplayerstats
+
+DB_CONFIG = {
+    "dbname": "proyecto01_bd",
+    "user": "postgres",
+    "password": "1506",
+    "host": "localhost",
+    "port": "5432",
+}
+
+SEASONS_API = {
+    2015: "2015-16",
+    2016: "2016-17",
+    2017: "2017-18",
+    2018: "2018-19",
+    2019: "2019-20",
+    2020: "2020-21",
+    2021: "2021-22",
+    2022: "2022-23",
+    2023: "2023-24",
+    2024: "2024-25",
+    2025: "2025-26",
+}
+
+
+def safe_int(value):
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def safe_float(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def cargar_player_season_stats(conn):
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT player_id FROM Player;")
+    valid_player_ids = {row[0] for row in cursor.fetchall()}
+
+    cursor.execute("SELECT team_id FROM Team;")
+    valid_team_ids = {row[0] for row in cursor.fetchall()}
+
+    total_insertados = 0
+    total_omitidos = 0
+
+    for season_id, season_str in SEASONS_API.items():
+        print(f"\n=== Temporada {season_str} (season_id={season_id}) ===")
+
+        try:
+            stats = leaguedashplayerstats.LeagueDashPlayerStats(
+                season=season_str,
+                season_type_all_star="Regular Season",
+            )
+            df = stats.get_data_frames()[0]
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"  ERROR al obtener datos para {season_str}: {e}")
+            continue
+
+        if df.empty:
+            print(f"  AVISO: sin datos para {season_str}")
+            continue
+
+        registros = []
+        omitidos_temporada = 0
+
+        for _, r in df.iterrows():
+            player_id = safe_int(r.get("PLAYER_ID"))
+            team_id = safe_int(r.get("TEAM_ID"))
+
+            if player_id is None or player_id not in valid_player_ids:
+                omitidos_temporada += 1
+                continue
+            if team_id is None or team_id not in valid_team_ids:
+                omitidos_temporada += 1
+                continue
+
+            registros.append(
+                (
+                    player_id,
+                    season_id,
+                    team_id,
+                    None,  
+                    safe_int(r.get("GP")),
+                    safe_float(r.get("MIN")),
+                    safe_float(r.get("PTS")),
+                    safe_float(r.get("AST")),
+                    safe_float(r.get("REB")),
+                    safe_float(r.get("OREB")),
+                    safe_float(r.get("DREB")),
+                    safe_float(r.get("STL")),
+                    safe_float(r.get("BLK")),
+                    safe_float(r.get("TOV")),
+                    safe_float(r.get("PF") if "PF" in df.columns else None),
+                    safe_float(r.get("FG_PCT")),
+                    safe_float(r.get("FG3_PCT")),
+                    safe_float(r.get("FT_PCT")),
+                    None,  
+                    safe_float(r.get("PIE")) if "PIE" in df.columns else None,
+                )
+            )
+
+        if registros:
+            execute_values(
+                cursor,
+                """INSERT INTO Player_season_stats (
+                    player_id, season_id, team_id, jersey, games_played,
+                    mins, pts, ast, reb, oreb, dreb, stl, blk, tov, pf,
+                    fg_pct, fg3_pct, ft_pct, all_star_appearances, pie
+                ) VALUES %s
+                ON CONFLICT (player_id, season_id, team_id) DO NOTHING""",
+                registros,
+            )
+            conn.commit()
+
+        print(f"  Insertados: {len(registros)} | omitidos (jugador/equipo no encontrado): {omitidos_temporada}")
+        total_insertados += len(registros)
+        total_omitidos += omitidos_temporada
+
+    cursor.close()
+    print(f"\nTOTAL: {total_insertados} insertados, {total_omitidos} omitidos en toda la carga.")
+
+
+def main():
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        cargar_player_season_stats(conn)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
